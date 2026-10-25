@@ -285,6 +285,64 @@ impl BrushContext {
         self.rasterize_into(d, dual, rect, out, None);
     }
 
+    /// A sampled tip's dab, laid down in blocks of [`LANES`] pixels by [`SampledTip`]: the general
+    /// loop's arithmetic, then its per-pixel steps (noise, per-tip Texture, Wet Edges, the stroke's
+    /// depth) in its order. `out` (and `depth`) are already the rectangle's size, all 0.
+    fn rasterize_sampled(&self, tip: &SampledTip<'_>, pass: SampledPass, d: &Dab, rect: Rect, out: &mut [f32], mut depth: Option<&mut Vec<f32>>) {
+        let SampledPass { cy, projected, aliased, noise, texture: tex_tip, wet } = pass;
+        let b = &self.brush;
+        let w = rect.width() as usize;
+        let features = noise || tex_tip || wet || depth.is_some();
+        for (yy, row) in out.chunks_exact_mut(w).enumerate() {
+            let y = rect.y0 + yy as i32;
+            let dy = y as f32 + 0.5 - cy;
+            // Only the columns that can pass the window test run it: about half a rotated
+            // tip's rectangle cannot. The others keep their 0 either way.
+            let (first, last) = tip.columns(rect.x0, rect.x1, dy, projected).unwrap_or((i64::MIN, i64::MAX));
+            let (blocks, rest) = row.as_chunks_mut::<LANES>();
+            let tail = (!rest.is_empty()).then_some(rest);
+            for (bi, block) in blocks.iter_mut().map(|b| &mut b[..]).chain(tail).enumerate() {
+                let x0 = rect.x0.wrapping_add((bi * LANES) as i32);
+                if i64::from(x0) + LANES as i64 <= first || i64::from(x0) > last {
+                    continue;
+                }
+                let (s, inside) = if projected { tip.block::<true>(x0, dy) } else { tip.block::<false>(x0, dy) };
+                if !features {
+                    store_plain(block, &s, &inside, aliased, d.alpha);
+                    continue;
+                }
+                // Noise, per-tip Texture, Wet Edges and the stroke's depth: the general
+                // loop's per-pixel steps, in its order.
+                for (i, slot) in block.iter_mut().enumerate() {
+                    if !inside[i] {
+                        continue;
+                    }
+                    let (xx, x) = (bi * LANES + i, x0.wrapping_add(i as i32));
+                    let mut val = if aliased { if s[i] >= 0.5 { 1.0 } else { 0.0 } } else { s[i] };
+                    let rn = 1.0 - s[i];
+                    if val <= 0.0 {
+                        continue;
+                    }
+                    if noise && val < 1.0 {
+                        let n = hash2(x, y, NOISE_SALT);
+                        let hard = if n < val { 1.0 } else { 0.0 };
+                        val += (hard - val) * 0.7;
+                    }
+                    if tex_tip {
+                        val = texture_combine(b.texture.mode, val, self.texture_at(x, y), d.depth);
+                    }
+                    if wet {
+                        val *= wet_factor(rn);
+                    }
+                    if let Some(dp) = depth.as_deref_mut().and_then(|dp| dp.get_mut(yy * w + xx)) {
+                        *dp = (1.0 - rn).clamp(0.0, 1.0);
+                    }
+                    *slot = val * d.alpha;
+                }
+            }
+        }
+    }
+
     /// [`rasterize`](Self::rasterize); with `depth`, Wet Edges is left out of `out` and each
     /// painted pixel's depth inside the dab (`1 − rn`) goes to `depth`, for the stroke to apply it.
     pub fn rasterize_into(&self, d: &Dab, dual: bool, rect: Rect, out: &mut Vec<f32>, mut depth: Option<&mut Vec<f32>>) {
@@ -368,55 +426,8 @@ impl BrushContext {
             && w > 0
         {
             let tip = SampledTip { cx, sn, cs, flip_x: fx, flip_y: fy, proj: proj.unwrap_or((0.0, 0.0, 0.0)), inv_scale, tw, th, ro, lw: *lw, lh: *lh, data };
-            let features = noise || tex_tip || wet || depth.is_some();
-            for (yy, row) in out.chunks_exact_mut(w).enumerate() {
-                let y = rect.y0 + yy as i32;
-                let dy = y as f32 + 0.5 - cy;
-                // Only the columns that can pass the window test run it: about half a rotated
-                // tip's rectangle cannot. The others keep their 0 either way.
-                let (first, last) = tip.columns(rect.x0, rect.x1, dy, proj.is_some()).unwrap_or((i64::MIN, i64::MAX));
-                let (blocks, rest) = row.as_chunks_mut::<LANES>();
-                let tail = (!rest.is_empty()).then_some(rest);
-                for (bi, block) in blocks.iter_mut().map(|b| &mut b[..]).chain(tail).enumerate() {
-                    let x0 = rect.x0.wrapping_add((bi * LANES) as i32);
-                    if i64::from(x0) + LANES as i64 <= first || i64::from(x0) > last {
-                        continue;
-                    }
-                    let (s, inside) = if proj.is_some() { tip.block::<true>(x0, dy) } else { tip.block::<false>(x0, dy) };
-                    if !features {
-                        store_plain(block, &s, &inside, aliased, d.alpha);
-                        continue;
-                    }
-                    // Noise, per-tip Texture, Wet Edges and the stroke's depth: the general
-                    // loop's per-pixel steps, in its order.
-                    for (i, slot) in block.iter_mut().enumerate() {
-                        if !inside[i] {
-                            continue;
-                        }
-                        let (xx, x) = (bi * LANES + i, x0.wrapping_add(i as i32));
-                        let mut val = if aliased { if s[i] >= 0.5 { 1.0 } else { 0.0 } } else { s[i] };
-                        let rn = 1.0 - s[i];
-                        if val <= 0.0 {
-                            continue;
-                        }
-                        if noise && val < 1.0 {
-                            let n = hash2(x, y, NOISE_SALT);
-                            let hard = if n < val { 1.0 } else { 0.0 };
-                            val += (hard - val) * 0.7;
-                        }
-                        if tex_tip {
-                            val = texture_combine(b.texture.mode, val, self.texture_at(x, y), d.depth);
-                        }
-                        if wet {
-                            val *= wet_factor(rn);
-                        }
-                        if let Some(dp) = depth.as_deref_mut().and_then(|dp| dp.get_mut(yy * w + xx)) {
-                            *dp = (1.0 - rn).clamp(0.0, 1.0);
-                        }
-                        *slot = val * d.alpha;
-                    }
-                }
-            }
+            let pass = SampledPass { cy, projected: proj.is_some(), aliased, noise, texture: tex_tip, wet };
+            self.rasterize_sampled(&tip, pass, d, rect, out, depth);
             return;
         }
         for yy in 0..h {
@@ -1431,6 +1442,18 @@ const LANES: usize = 8;
 /// multiply-adds), so the coverage has the same bits, except that a NaN may carry another
 /// payload. Only the four texel reads of each bilinear sample stay scalar, and inside the level
 /// they read two adjacent texels per row without testing each texel against the level's edges.
+/// How [`BrushContext::rasterize_sampled`] lays a sampled dab down: the dab centre's row, Brush
+/// Projection on or off, and the general loop's per-pixel steps that apply.
+#[derive(Clone, Copy)]
+struct SampledPass {
+    cy: f32,
+    projected: bool,
+    aliased: bool,
+    noise: bool,
+    texture: bool,
+    wet: bool,
+}
+
 struct SampledTip<'a> {
     cx: f32,
     sn: f32,
@@ -1484,6 +1507,9 @@ impl SampledTip<'_> {
         let (cx, dy) = (f64::from(self.cx), f64::from(dy));
         let (sn, cs, flip_x, flip_y) = (f64::from(self.sn), f64::from(self.cs), f64::from(self.flip_x), f64::from(self.flip_y));
         let (inv, tw, th, ro) = (f64::from(self.inv_scale), f64::from(self.tw), f64::from(self.th), f64::from(self.ro));
+        // The error terms take magnitudes: a direct caller's negative radius (and roundness)
+        // makes `inv` (and `ro`) negative, which would shrink the margin and the size below.
+        let (inv_a, ro_a) = (inv.abs(), ro.abs());
         // Rounding error of the f32 mapping: `dx` carries at most three roundings of magnitudes
         // up to `d`, the projection and rotation scale it by at most `2p`, and each of their 14
         // roundings (counted 24 times) is of a magnitude up to `g`; then the scale and offset.
@@ -1492,11 +1518,11 @@ impl SampledTip<'_> {
         let p = 1.0 + 2.0 * k.abs();
         let g = 2.0 * p * (d + e_d) * (1.0 + 8.0 * eps);
         let e_uv = 2.0 * p * e_d + 24.0 * eps * g;
-        let e_px = inv * e_uv + 3.0 * eps * (g * inv + tw);
-        let e_py = inv / ro * e_uv + 4.0 * eps * (g * inv / ro + th);
+        let e_px = inv_a * e_uv + 3.0 * eps * (g * inv_a + tw);
+        let e_py = inv_a / ro_a * e_uv + 4.0 * eps * (g * inv_a / ro_a + th);
         let margin = 2.0 * (e_px.max(e_py) + eps * (tw + th + 2.0)) + 1e-3;
         // Below 1e9 nothing overflows and f64's own error (~1e-6) is far inside the margin.
-        let size = g * inv / ro + g * inv + tw + th;
+        let size = g * inv_a / ro_a + g * inv_a + tw + th;
         if !(size < 1e9 && margin.is_finite() && [ax, ay, k, sn, cs, flip_x, flip_y, inv, tw, th, ro].iter().all(|v| v.is_finite())) {
             return None;
         }
